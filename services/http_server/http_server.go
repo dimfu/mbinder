@@ -1,14 +1,16 @@
 package http_server
 
 import (
+	"bytes"
 	"context"
+	"embed"
 	"fmt"
+	"html/template"
 	"io"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strings"
+	"path"
 	"syscall"
 
 	"github.com/dimfu/mbinder/models"
@@ -19,30 +21,17 @@ const (
 	TEMP_DIR = "images"
 )
 
-func temp(items []*models.Item) (string, error) {
-	p, err := os.MkdirTemp("", TEMP_DIR)
+var (
+	//go:embed templates *
+	templateDir embed.FS
+	templates   map[string]*template.Template
+)
+
+func init() {
+	err := getAllTemplate()
 	if err != nil {
-		return "", err
+		panic(err)
 	}
-	for _, item := range items {
-		f, err := os.Open(item.Path)
-		if err != nil {
-			return "", err
-		}
-		defer f.Close()
-		name := filepath.Base(item.Path)
-		dstPath := filepath.Join(p, name)
-		dstFile, err := os.Create(dstPath)
-		if err != nil {
-			return "", err
-		}
-		_, err = io.Copy(dstFile, f)
-		if err != nil {
-			return "", err
-		}
-		item.Path = name
-	}
-	return p, nil
 }
 
 func Run(items []*models.Item) {
@@ -53,14 +42,13 @@ func Run(items []*models.Item) {
 	fs := http.FileServer(http.Dir(imgDir))
 	http.Handle("/images/", http.StripPrefix("/images/", fs))
 	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		for _, item := range items {
-			var tags []string
-			for _, tag := range item.Tags {
-				tags = append(tags, tag.Name)
-			}
-			tagsToStr := strings.Join(tags, ", ")
-			fmt.Fprintf(w, "<div><h2>%s</h2><img src='/images/%s' width='300'/><span>%s</span></div>", item.Path, item.Path, tagsToStr)
+		err := renderTemplate(w, "index.tmpl", map[string]interface{}{
+			"data": map[string]interface{}{
+				"title": "Home",
+			},
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	})
 
@@ -81,4 +69,108 @@ func Run(items []*models.Item) {
 
 	os.RemoveAll(imgDir)
 	fmt.Println("Server successfully shut down")
+}
+
+func temp(items []*models.Item) (string, error) {
+	p, err := os.MkdirTemp("", TEMP_DIR)
+	if err != nil {
+		return "", err
+	}
+	for _, item := range items {
+		f, err := os.Open(item.Path)
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+		name := path.Base(item.Path)
+		dstPath := path.Join(p, name)
+		dstFile, err := os.Create(dstPath)
+		if err != nil {
+			return "", err
+		}
+		_, err = io.Copy(dstFile, f)
+		if err != nil {
+			return "", err
+		}
+		item.Path = name
+	}
+	return p, nil
+}
+
+func readFolder(dir string) ([]string, error) {
+	var files []string
+	entries, err := templateDir.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return files, nil
+		}
+		return files, err
+	}
+
+	for _, entry := range entries {
+		fp := path.Join(dir, entry.Name())
+		if entry.IsDir() {
+			_files, err := readFolder(fp)
+			if err != nil {
+				return files, err
+			}
+			files = append(files, _files...)
+		} else {
+			files = append(files, fp)
+		}
+
+	}
+
+	return files, nil
+}
+
+func getAllTemplate() error {
+	if templates == nil {
+		templates = make(map[string]*template.Template)
+	}
+
+	layouts, err := readFolder("templates/layouts")
+	if err != nil {
+		return err
+	}
+
+	includes, err := readFolder("templates/includes")
+	if err != nil {
+		return err
+	}
+
+	basePath := "templates/base.tmpl"
+
+	for _, layout := range layouts {
+		if path.Ext(layout) != ".tmpl" {
+			continue
+		}
+		files := append(includes, layout, basePath)
+		name := path.Base(layout)
+		tmpl, err := template.New(name).ParseFS(templateDir, files...)
+		if err != nil {
+			return err
+		}
+		templates[name] = tmpl
+	}
+
+	return nil
+}
+
+func renderTemplate(w http.ResponseWriter, name string, data map[string]interface{}) error {
+	tmpl, ok := templates[name]
+	if !ok {
+		return fmt.Errorf("template %s does not exists\n", name)
+	}
+	var buf bytes.Buffer
+	err := tmpl.ExecuteTemplate(&buf, "base.tmpl", data)
+	if err != nil {
+		return err
+	}
+
+	// fmt.Println("Rendered HTML:", buf.String())
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, err = buf.WriteTo(w)
+	return err
 }
